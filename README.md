@@ -16,6 +16,10 @@ Numbers are measured on the shipped configuration; the folder READMEs say how. Q
 vllm-tpu with one patch. GLM-5.3-Flash runs on an engine we wrote in JAX for it; as far as we
 know it is the first to run that model on a TPU.
 
+A third folder, [`qwen38-flash-next/`](qwen38-flash-next/), is a skeleton for Qwen3.8-Flash-Next
+with no measured numbers, because no real-weight run of it has ever completed. Its README is a
+status report rather than a recipe; read it before spending TPU quota on it.
+
 ## What you need
 
 A Kaggle account with TPU access (phone-verify it under Settings) and its free quota,

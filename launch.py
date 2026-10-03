@@ -35,18 +35,25 @@ WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 GLM_DATASETS = ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2",
                 "rahim3/glm53-flash-fp8-1", "rahim3/glm53-flash-fp8-2", "rahim3/glm53-flash-fp8-3", "rahim3/glm53-flash-fp8-4"]
+# Qwen3.8-Flash-Next needs an NVFP4 export as a mounted dataset (the HF mirror is ~106 GB
+# and does not fit in a session's own disk). Create this dataset before first use; the
+# slug below is a placeholder. See qwen38-flash-next/tools/NOTES.md.
+FLASHNEXT_WEIGHTS_DATASET = "CHANGEME/qwen3-8-flash-next-nvfp4"
 
 # One entry per model folder: the kernel script, the default kernel name, and (for our own engine) the package to embed.
 MODELS = {
     "qwen38-27b": {"kernel": KERNEL_SRC, "slug": "qwen38-tpu-serve", "model_name": "qwen3.8-27b", "minutes": 22},
     "glm53-flash": {"kernel": HERE / "glm53-flash" / "kernel" / "serve_glm53.py", "slug": "glm53-tpu-serve",
                     "model_name": "glm-5.3-flash", "engine": HERE / "glm53-flash" / "engine" / "glm53", "minutes": 25},
+    "qwen38-flash-next": {"kernel": HERE / "qwen38-flash-next" / "kernel" / "serve_qwen38_flash_next.py",
+                          "slug": "qwen38-flash-next-serve", "model_name": "qwen3.8-flash-next", "minutes": 45},
 }
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
     "install":            "Building the Python runtime with uv (~30 s)...",
     "installed":          "Runtime ready.",
+    "overlay-applied":    "Qwen4Exp JAX overlay installed.",
     "mtp-patch-applied":  "MTP state-rollback patch applied.",
     "mtp-patch-failed":   "MTP patch did not apply — speculative decoding disabled for safety.",
     "cache-restored":     None,  # rendered below (depends on config coverage)
@@ -138,6 +145,27 @@ def cmd_serve(args):
         if args.no_async_scheduling:
             cfg["async_scheduling"] = False
         datasets = [args.weights_dataset, ENV_DATASET]
+    elif args.model == "qwen38-flash-next":
+        # This recipe has no measured baseline, so it ships conservative defaults rather
+        # than inheriting the 27B ones (262k context, MTP on, multimodal).
+        cfg = {
+            "ntfy_topic": topic,
+            "api_key": api_key,
+            "max_model_len": args.max_model_len if args.max_model_len != 262144 else 32768,
+            "max_num_seqs": args.max_num_seqs,
+            "keepalive_min": args.keepalive_min,
+            "weights_dataset": (FLASHNEXT_WEIGHTS_DATASET
+                                if args.weights_dataset == WEIGHTS_DATASET else args.weights_dataset),
+        }
+        if args.no_tools:
+            cfg["tool_call_parser"] = ""
+        if args.verbose:
+            cfg["verbose"] = True
+        if args.fast_start:
+            cfg["fast_start"] = True
+        # No env dataset: none has been built for this recipe's graphs, and attaching the
+        # 27B bundle would only add a cache that can never match.
+        datasets = [cfg["weights_dataset"]]
     else:
         cfg = {
             "ntfy_topic": topic,

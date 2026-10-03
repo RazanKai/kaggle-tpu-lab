@@ -41,9 +41,41 @@ that takes about 22 minutes.)
 If the last cell stops in its first minute, its message says why: no TPU in this session (Kaggle does that
 sometimes; stop and start the session again), Internet off, or a dataset not attached.
 """,
+"qwen38-flash-next": """# Qwen3.8-Flash-Next on a free Kaggle TPU v5e-8
+
+> **This recipe is a skeleton and has never completed a real-weight run.** It publishes no speed numbers, because
+> there are none. Read this cell before you spend TPU quota: the first run is a debugging run.
+
+This notebook attempts to serve **Qwen3.8-Flash-Next** (`Qwen4Exp`) — a 125B-parameter ultra-sparse MoE with 6B
+active per token, plus a 51B N-gram embedding table — on Kaggle's free TPU v5e-8. It is an early preview of the Qwen4
+architecture: gated-DeltaNet linear attention interleaved 3:1 with Qwen Sparse Attention, and an embedding table the
+model's designers intended to live in **host RAM** rather than on the accelerator.
+
+That last design choice is the reason this is worth attempting at all on a 128 GB machine: the checkpoint is 335 GiB
+in bf16 and 173 GiB in FP8, so nothing published fits in HBM whole. A 4-bit export plus a host-resident N-gram table
+is the only configuration with a plausible chance. See `tools/NOTES.md` in the repo for the arithmetic.
+
+## Before you run — three clicks in the right sidebar
+1. **Accelerator → TPU VM v5e-8** (Session options)
+2. **Internet → ON** (Session options; needed for the runtime and the tunnel)
+3. **Add Input** → attach your NVFP4 weights dataset (see the config cell: `weights_dataset` is a placeholder until
+   you create it)
+
+## What you should expect
+
+A failure with a clear reason, in the kernel log or in `/kaggle/working/vllm.log`. The most likely walls, in order:
+weight-name mapping against the real export, HBM exhaustion during load, XLA compile of the sparse-attention paths,
+and — if it comes up — incoherent output. If HBM is the wall, the honest result is "this does not fit on v5e-8 in
+any published format", and that is worth knowing.
+
+The engine is not in this notebook's repo: it is a third-party `tpu-inference` overlay fetched at a pinned commit,
+because upstream `tpu-inference` has no Qwen4Exp model at all.
+""",
 }
 
-CONFIG = {"glm53-flash": {"streams": 4, "max_len": 262144, "reasoning_effort_default": "low", "vision": True, "keepalive_min": 90}}
+CONFIG = {"glm53-flash": {"streams": 4, "max_len": 262144, "reasoning_effort_default": "low", "vision": True, "keepalive_min": 90},
+          "qwen38-flash-next": {"max_model_len": 32768, "max_num_seqs": 8, "text_only": True,
+                              "mtp_tokens": 0, "ple_cpu_offload": True, "keepalive_min": 90}}
 
 CONFIG_NOTES = {"glm53-flash": """### Configuration
 The defaults above are what we serve. Things you might change:
@@ -55,6 +87,19 @@ The defaults above are what we serve. Things you might change:
   long-lived endpoint; the default keeps a test run cheap on your TPU quota.
 - `api_key`: set your own; otherwise one is generated and printed in the banner.
 - `ntfy_topic`: optional; the script posts its progress to `ntfy.sh/<topic>` so you can follow it from your phone.
+""",
+"qwen38-flash-next": """### Configuration
+The defaults above are the conservative ones, because nothing in this recipe has been measured yet:
+- `max_model_len`: **32k**, not the model's native 262,144. The weights plus the 51B N-gram table are close to the
+  HBM ceiling; raise this only if the first run shows there is room.
+- `max_num_seqs`: 8 concurrent requests.
+- `text_only`: leave `true`. The TPU implementation of this model does not include the vision tower.
+- `mtp_tokens`: `0`. MTP is a stub in the engine, so speculative decoding would not speed anything up.
+- `ple_cpu_offload`: `true` keeps the 51B N-gram table in host RAM instead of HBM, which is what makes the memory
+  budget work out at all.
+- `keepalive_min`: the server shuts itself down after this long, so a failed experiment does not burn your whole
+  weekly TPU quota while you sleep.
+- `api_key`: set your own; otherwise one is generated and printed in the banner.
 """,
 }
 
@@ -79,6 +124,27 @@ Claude Code (the banner prints this line filled in):
 ```bash
 ANTHROPIC_BASE_URL=<ENDPOINT> ANTHROPIC_AUTH_TOKEN=<API_KEY> ANTHROPIC_MODEL=glm-5.3-flash \\
 ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144 claude
+```
+""",
+"qwen38-flash-next": """### Launch (leave this cell running: it is the server)
+What you will see, step by step — and what to expect, which is not a working server yet:
+1. **Runtime** — a pinned TPU runtime, then the JAX/TPU Qwen4Exp overlay fetched at a pinned commit
+2. **Weights** — the NVFP4 export off the attached dataset (a Hugging Face download usually cannot fit)
+3. **Server** — vLLM starts with the JAX backend, text-only, no MTP, N-gram table in host RAM
+4. **Tunnel** — a public URL
+5. **READY banner** with `ENDPOINT`, `API KEY` and `MODEL` — if you get this far, that is already new
+
+This recipe has never completed a real-weight run on a TPU. The first attempt is expected to fail in the weight
+loader or in XLA compile. The kernel prints the root cause and the first error block from `vllm.log` when the
+server dies: that log is the useful artifact of a first run, not the endpoint.
+
+If it does come up, use it like any OpenAI endpoint:
+```bash
+curl <ENDPOINT>/v1/chat/completions -H "Authorization: Bearer <API_KEY>" \\
+  -H "Content-Type: application/json" -d '{
+    "model": "qwen3.8-flash-next",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 """,
 }
@@ -125,7 +191,8 @@ def main():
     nb = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                                        "language_info": {"name": "python", "version": "3.12"}},
           "nbformat": 4, "nbformat_minor": 5}
-    out = folder / "notebook" / f"{model.split('-')[0]}-tpu-serve.ipynb"
+    name = {"qwen38-flash-next": "qwen38-flash-next"}.get(model, model.split("-")[0])
+    out = folder / "notebook" / f"{name}-tpu-serve.ipynb"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n")
     print(f"wrote {out.relative_to(ROOT)}: {len(cells)} cells, {out.stat().st_size / 1024:.0f} KB")
