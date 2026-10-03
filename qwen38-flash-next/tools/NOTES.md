@@ -33,10 +33,11 @@ Kaggle TPU v5e-8 = 8 chips × 16 GB = **128 GB HBM**, single host.
 | `tcclaviger/...-MXFP4-FP8-GPTQ` | 120.3 GB | ✗ marginal |
 | `albucino/...-W4A16-FP8PLE` | 120.1 GB | ✗ marginal |
 | `Jundot/...-oQ4e-mtp` | 106.3 GB | ⚠️ |
-| `local-inference-lab/...-NVFP4` | 106.3 GB, has `hf_quant_config.json` | ⚠️ **chosen starting point** |
+| `local-inference-lab/...-NVFP4` | 106.3 GB, has `hf_quant_config.json` | ⚠️ but MXFP8 linears |
 | `cafonez/...-HC-Q8` | 92.3 GB | ⚠️ format unknown |
 | `pentacoxian-dev/...-IQ3E-Q8D-MTP` | 80.0 GB GGUF | ⚠️ **GGUF: the TPU overlay cannot read it** |
 | `beamster/...-Sushi-2.6bpw` | 44.0 GB | ✓ but format unknown |
+| `nvidia/...-NVFP4` | 132.6 GB by index metadata | ✓ **chosen: contains no format the loader lacks** |
 
 Sizes are the sum of `*.safetensors`/`*.gguf` from the HF tree API (decimal GB unless
 suffixed GiB). The BF16/FP8 numbers match Qwen's and vLLM's published figures.
@@ -56,6 +57,28 @@ So the recipe's defaults are: NVFP4 export + `VLLM_PLE_CPU_OFFLOAD=1` + 32k cont
 If the host-RAM path does not work on TPU, the fallback is a smaller artifact
 (`beamster/...-Sushi-2.6bpw`) plus a GGUF reader — which the TPU overlay does not have.
 
+### 2b. The budget, computed from the real index (2026-10-03)
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4`, by mapping every tensor name in
+`model.safetensors.index.json` (299,545 tensors) to its file and summing sizes:
+
+| Component | Precision | Bytes |
+|---|---|---|
+| routed experts (512 per layer) | NVFP4 triplets | ~69 GB |
+| n-gram table (128 shards) | FP8 + one global scale | ~51 GB |
+| GDN linear attention | BF16 (excluded from quantization) | ~4 GB |
+| QSA attention, shared experts, GatedResidual, embed, norms | BF16 | ~4 GB |
+| vision tower + MTP | BF16, not loaded | ~1 GB |
+
+With the table in host RAM: **~74 GB device-resident, ~46 GB left of 128 GB**, and ~51 GB
+of host RAM for the buffer. The same exercise on `local-inference-lab/...-NVFP4` gives
+69.4 GB experts + 28.5 GB table + 3.8 GB GDN + ~4 GB other = 77.3 GB device-resident and
+50.7 GB free — a slightly better HBM budget, but ~6.5 GB of MXFP8 linears the loader
+cannot read.
+
+Seven of that export's 43 shards are mixed, so those numbers are apportioned by tensor
+count and are good to a few percent, not exact.
+
 ## 3. Weight delivery — the one thing that needs a human
 
 The kernel can read weights from an attached Kaggle dataset or download from HF. For a
@@ -74,9 +97,10 @@ kernel will try the HF download and probably run out of disk.
 
 ## 4. Status: verified vs assumed
 
-**Verified on this machine (CPU, no TPU).** The overlay at commit `be41c49` (v79) runs
-its own test suite green against a modern stack — `jax 0.11.2`, `flax 0.12.10`,
-`torch 2.14.1+cpu`, `transformers 5.18.0`:
+**Verified 2026-10-03 on this machine (CPU, no TPU).** Two independent checks.
+
+*The overlay's own suite.* At commit `be41c49` (v79) it is green against a modern stack —
+`jax 0.11.2`, `flax 0.12.10`, `torch 2.14.1+cpu`, `transformers 5.18.0`:
 
 ```
 35 passed, 1 skipped   (tests/models/jax/test_qwen4_exp.py)
@@ -90,12 +114,28 @@ full forward, GDN norm against upstream `Qwen3NextRMSNormGated`, GatedResidual
 isolation, the dilated conv gather, live parameter paths against the loader contract,
 sharding specs divisible by TP, and the host-RAM PLE table lookup.
 
-**Assumed, not verified.** Everything about the actual run: that the NVFP4 export's
-tensor names match what the loader expects at real scale, that 106 GB of weights plus a
-host-resident N-gram table plus KV cache fit, that XLA compiles the QSA Pallas paths,
-and that the output is coherent. The overlay's own docs list these as open gaps
-(GDN parity against the FLA reference, QSA side caches replaced by per-forward
-recompute, MRoPE/vision unsupported, MTP a stub).
+*The checkpoint contract.* Read from the real `model.safetensors.index.json`
+(33 MB of names, no weights downloaded):
+
+| Loader rule (`weight_loader.py`) | Checkpoint reality (`nvidia/...-NVFP4`) | |
+|---|---|---|
+| `PREFIX_MAP`: `model.language_model.` → `model.` | every text tensor is under it | ✓ |
+| `STACKED_MAP`: `ple.key_proj` + `ple.value_proj` → one `ple.kv_proj` | both present as separate tensors | ✓ |
+| `TRANSPOSE_SUBSTR`: `.ple.ple_embedding.` → `.ple.embedding.` | `layers.1.ple.ple_embedding.ngram_embedding.shard_N` | ✓ |
+| `is_ngram_embedding()` keys on `ngram_embedding` | 128 `shard_N.weight` + 1 global `weight_scale` | ✓ |
+| `mlp.experts.{gate,up}_proj` → `gate_up_proj`, per-expert NVFP4 triplets | `experts.{0..511}.{gate,up,down}_proj` + `weight_scale`/`weight_scale_2`/`input_scale` | ✓ |
+| `mtp.layers.N.mlp.experts.*` never loaded | present in the checkpoint | ✓ (ignored) |
+| recognizes bf16, NVFP4, FP8+global scale, W4A16, GPTQ | NVFP4 experts, FP8 table, bf16 linears | ✓ |
+| any MXFP8 support | absent | ✗ — but the `nvidia` export has none |
+
+That was the wall I expected first, and it looks right. It also means the smaller
+`local-inference-lab` export is the worse first bet: 384 of its layer entries are MXFP8.
+
+**Assumed, not verified.** That ~74 GB of weights plus a ~51 GB host buffer plus KV cache
+load and fit; that `VLLM_PLE_CPU_OFFLOAD` — or the overlay's own host-table path — engages
+on TPU; that XLA compiles the QSA paths at real shapes; and that the output is coherent.
+The overlay's own docs list the remaining gaps (GDN parity against the FLA reference,
+QSA side caches replaced by per-forward recompute, MRoPE/vision unsupported, MTP a stub).
 
 **A caveat about the overlay.** Its README documents a file layout (`qsa.py`, `ngram.py`,
 `weight_loader.py`, `quant.py`) that the v79 commit has outgrown, and its cited Kaggle
@@ -118,10 +158,15 @@ format anyone has published", and the right deliverable is that result with the 
 
 ## 6. Open questions to settle before spending quota
 
-- Which export does the overlay's loader actually match? Its docs name NVFP4
-  (`modelopt_fp4`) and GPTQ INT4 (group 128, asymmetric). `local-inference-lab/...-NVFP4`
-  ships `hf_quant_config.json`, so it is the closest match on paper.
+- ~~Which export does the loader actually match?~~ **Settled:** `nvidia/...-NVFP4` — NVFP4
+experts, an FP8 n-gram table with a global scale, and BF16 linears. The name contract
+was checked against the real index and matches. `local-inference-lab/...-NVFP4` is
+17 GB smaller but leans on MXFP8, which the loader does not implement.
 - Does anything on TPU consume `VLLM_PLE_CPU_OFFLOAD`? If not, the recipe needs the
   overlay's own host-table path wired into the runner rather than vLLM's env flag.
-- Does Kaggle's TPU image have enough host RAM for a 28–51 GB host buffer in addition to
-  the VM's normal footprint?
+- Does Kaggle's TPU image have enough host RAM for a ~28–51 GB host buffer in addition to
+  the VM's normal footprint? Unknown; the v5e-8 slice is a single host with 8 chips, so it
+  probably does, but this has not been checked on the box.
+- The loader's per-expert path must handle 298k tensors without materializing them all.
+  The overlay's commit history mentions exactly this fight ("95/381 GB temporaries on a
+  51 GB table"), so expect it to be the long pole even with the formats correct.

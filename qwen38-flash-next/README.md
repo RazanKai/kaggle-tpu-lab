@@ -26,19 +26,42 @@ new work is QSA (sparse attention with a compressed indexer) and PLE (the N-gram
 
 Kaggle TPU v5e-8 is 8 × 16 GB = **128 GB of HBM**.
 
-| Checkpoint | Size | Fits? |
+| Checkpoint | Size | Fits in 128 GB? |
 |---|---|---|
 | `Qwen/Qwen3.8-Flash-Next` (bf16) | 335.3 GiB | ✗ |
 | `Qwen/Qwen3.8-Flash-Next-FP8` | 172.8 GiB | ✗ |
-| `nvidia/...-NVFP4` | 123.6 GB | ✗ |
-| `local-inference-lab/...-NVFP4` | 106.3 GB | ⚠️ the starting point here |
-| `beamster/...-Sushi-2.6bpw` | 44.0 GB | ✓ but unreadable by the TPU stack (see below) |
+| `nvidia/...-NVFP4` | 123.6 GB | ⚠️ **the starting point here** — see below |
+| `local-inference-lab/...-NVFP4` | 106.3 GB | ⚠️ smaller, but its linears are MXFP8 |
+| `beamster/...-Sushi-2.6bpw` | 44.0 GB | unreadable by the TPU stack (GGUF) |
 
-A ~106 GB export leaves ~22 GB for KV cache, activations, XLA workspace and compiled
-graphs. The lever that makes this plausible is moving the 51 B N-gram table to host RAM
-(~28 GB at 4-bit) — which is what the architecture was designed for, what vLLM
-implements as `VLLM_PLE_CPU_OFFLOAD=1`, and what upstream vLLM's own recipe says **is not
-supported on TPU**. The recipe therefore enables it and hopes the port honors it.
+A ~124 GB export leaves ~46 GB for KV cache, activations, XLA workspace and compiled
+graphs **once the n-gram table is moved out of HBM** — which is what the architecture was
+designed for, what vLLM implements as `VLLM_PLE_CPU_OFFLOAD=1`, and what upstream vLLM's
+own recipe says is *not* supported on TPU. The recipe enables it and hopes the port
+honors it.
+
+### Why the `nvidia` export
+
+The overlay's loader recognizes plain BF16, ModelOpt NVFP4 triplets, FP8 with a global
+scale, compressed-tensors W4A16 and GPTQ. It does **not** know MXFP8. That splits the two
+candidate exports:
+
+| | `nvidia/...-NVFP4` | `local-inference-lab/...-NVFP4` |
+|---|---|---|
+| routed experts | NVFP4 ✓ | NVFP4 ✓ |
+| n-gram table | FP8 + one global scale ✓ | NVFP4 ✓ |
+| attention / GDN / shared expert | BF16 (excluded from quantization) ✓ | **MXFP8 ✗** |
+| size | 123.6 GB | 106.3 GB |
+| device-resident after offload | ~74 GB | ~77 GB |
+| host RAM for the table | ~51 GB | ~28 GB |
+
+Every quantization format in the `nvidia` export is one the overlay already handles; its
+cost is a larger host buffer. The smaller export would need an MXFP8 dequantization path
+written first. Measure the tensor-name contract before spending quota: the loader's
+`PREFIX_MAP` (`model.language_model.` → `model.`), its `STACKED_MAP` (`ple.key_proj` +
+`ple.value_proj` → one `ple.kv_proj`), its `mtp.*`-is-never-loaded rule and its per-expert
+NVFP4 triplet handling all line up with these checkpoints' actual tensor names — that is
+the one part of the port that already looks right.
 
 ## What's in this folder
 
@@ -62,9 +85,11 @@ unsupported for this architecture, so nothing serves this model without that ove
 ## Prerequisites
 
 1. A Kaggle account with TPU access (phone-verified) and its ~20 TPU-hours/week.
-2. **A weights dataset.** The 106 GB export must be attached as a Kaggle dataset —
+2. **A weights dataset.** A 106–124 GB export must be attached as a Kaggle dataset —
    a session's own scratch space cannot hold it, so the Hugging Face fallback in the
-   kernel is a formality. See [`tools/NOTES.md` §3](tools/NOTES.md).
+   kernel is a formality. `nvidia/Qwen3.8-Flash-Next-NVFP4` is the default here because
+   every quantization format in it is one the loader already knows. See
+   [`tools/NOTES.md` §3](tools/NOTES.md).
 3. Then, from the repo root:
 
 ```bash
@@ -93,8 +118,18 @@ divisibility. It does **not** test real weights on real hardware — nobody has.
 
 ## Known landmines
 
-- **Weight-name mapping at full scale** is unvalidated; the overlay's loader has been
-  exercised against mock checkpoints and a single-file inspection path.
+- **The host-RAM n-gram table has to actually engage.** With it device-resident, the
+  weights alone are ~124 GB of a 128 GB budget; with it in host RAM, ~74 GB and the
+  arithmetic works. Upstream vLLM refuses the TPU path for exactly this feature, so the
+  bet is on the overlay's own implementation — which its commit history says is "live"
+  but which has only been exercised at small scale.
+- **MXFP8 is not implemented** in the loader. This is why the `nvidia` export is the
+  default rather than the 17 GB smaller `local-inference-lab` one, whose attention, GDN
+  and shared-expert linears are MXFP8.
+- **Weight-name mapping** is the part that looks right: the loader's prefix rules,
+  key/value stacking for the PLE projection, per-expert NVFP4 triplets and
+  never-load-`mtp.*` rules all match these checkpoints' real tensor names. Validate it on
+  the real index before spending quota, not during the run.
 - **HBM exhaustion** during load is the most likely wall, and there is a real chance the
   answer is "this model does not fit on v5e-8 in any published format".
 - **QSA side caches are not implemented** in the overlay (it recomputes per forward), so

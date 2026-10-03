@@ -52,7 +52,7 @@ DEFAULTS = {
     "overlay_commit": "be41c49",   # v79 — "host-RAM table live". Bump deliberately.
     "weights_dataset": "CHANGEME/qwen3-8-flash-next-nvfp4",  # Kaggle dataset holding the export
     "env_dataset": "",            # no compile cache exists for this recipe yet
-    "hf_model_id": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",  # ~106 GB; see NOTES.md
+    "hf_model_id": "nvidia/Qwen3.8-Flash-Next-NVFP4",  # ~124 GB; the format match is why — see NOTES.md
     "max_model_len": 32768,        # 32k to start: nothing here is proven at 262k
     "max_num_seqs": 8,
     "mtp_tokens": 0,               # the overlay's MTP head is a stub, not a drafter
@@ -434,7 +434,7 @@ else:
     publish("cache-missing", note="cold compile: expect ~10 extra minutes")
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "NVFP4, ~106 GB — the budget is in ../tools/NOTES.md")
+banner(3, "Model weights", "NVFP4 experts + an FP8 n-gram table, ~124 GB")
 weights_slug = CFG["weights_dataset"].split("/")[-1]
 model_path = find_input(weights_slug)
 if model_path and not os.path.exists(os.path.join(model_path, "config.json")):
