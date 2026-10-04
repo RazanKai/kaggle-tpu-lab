@@ -1,0 +1,20 @@
+diff --git a/tpu_inference/models/jax/qwen4_exp/weight_loader.py b/tpu_inference/models/jax/qwen4_exp/weight_loader.py
+index 5acd5f9..4460ff4 100644
+--- a/tpu_inference/models/jax/qwen4_exp/weight_loader.py
++++ b/tpu_inference/models/jax/qwen4_exp/weight_loader.py
+@@ -163,6 +163,15 @@ def is_ignored_missing(name: str) -> bool:
+ 
+     if "hyper_connection_mixer.block_inject_weight" in name:
+         return True
++    # GDN's A_log / dt_bias carry no ".weight" suffix but are real parameters
++    # (gdn.py declares both as nnx.Param and the forward gates the recurrent
++    # state with sigmoid(dt_bias + exp(A_log))). IGNORED_MISSING_SUFFIXES
++    # contains "_bias", which matches ".dt_bias", so without this guard the
++    # 36 dt_bias tensors are silently dropped at load and the decay stays at
++    # its zero init. is_gdn_param() is consulted *only* here and by the
++    # coverage report, so this is the single place the distinction matters.
++    if is_gdn_param(name):
++        return False
+     # MTP draft-model tensors (mtp.*): our MTP is a stub sharing the target
+     # trunk (model.py::Qwen4ExpMTP), so draft-only weights such as
+     # mtp.layers.N.mlp.experts.{down_proj,gate_up_proj} are never loaded.

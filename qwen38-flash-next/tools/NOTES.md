@@ -137,6 +137,71 @@ on TPU; that XLA compiles the QSA paths at real shapes; and that the output is c
 The overlay's own docs list the remaining gaps (GDN parity against the FLA reference,
 QSA side caches replaced by per-forward recompute, MRoPE/vision unsupported, MTP a stub).
 
+## 4b. A silent bug the contract check found (patched here)
+
+The coverage run reported 3,300 "ignored" tensors. 3,095 were `mtp.*` (a stub in the
+overlay), 166 were vision `*.bias` (vision unsupported) — and **36 were `linear_attn.dt_bias`**,
+which is not in either category.
+
+`_GDN_NOWEIGHT_PARAMS = ('.A_log', '.dt_bias', ...)` exists precisely to say "these have no
+`.weight` suffix but are real parameters". But `IGNORED_MISSING_SUFFIXES` contains `'_bias'`,
+which also matches `.dt_bias`, and `is_ignored_missing()` is consulted in the load path
+(`weight_loader.py` around the drop rule) *before* anything that would keep it.
+`is_gdn_param()` is never called during loading at all — it is used only by the coverage
+report, so the two rules never meet.
+
+The consequence is not a crash. `gdn.py` declares `self.dt_bias = nnx.Param(zeros)` and the
+forward computes
+
+```python
+decay = jax.nn.sigmoid(self.dt_bias.value + jnp.exp(self.A_log.value))   # [V] in (0,1)
+```
+
+so with `dt_bias` left at its zero init, every one of the 36 GDN layers gates its recurrent
+state with a systematically wrong decay. `A_log` loads fine (its name matches no ignored
+suffix). The error compounds along the recurrence, so the symptom would be degradation that
+grows with sequence length — the kind of thing that gets misdiagnosed as "the Pallas GDN
+kernel is wrong" or "QSA recompute is broken" after two 9-hour sessions.
+
+Measured blast radius, by running `endswith` over the real index:
+
+```
+names ending in '_bias' : 36   all of them linear_attn.dt_bias
+names ending in '.bias' : 166  all of them model.visual.*
+```
+
+So `'_bias'` catches exactly one thing, and it is a parameter the model needs.
+
+**Fix** (`patches/gdn-dt-bias-ignored.diff`, 1,221 bytes):
+
+```python
+    if is_gdn_param(name):     # A_log / dt_bias are real despite no ".weight"
+        return False
+```
+
+as the first rule in `is_ignored_missing()`. The kernel applies it to the overlay checkout
+after fetching and hard-fails if it stops applying, so a future overlay revision cannot
+silently reintroduce the drop.
+
+**Evidence, all local:**
+
+| Check | Pristine overlay | Patched |
+|---|---|---|
+| `is_ignored_missing('model.layers.0.linear_attn.dt_bias')` | `True` | `False` |
+| coverage over the real 299,545-name index | 295,805 mapped / 3,300 ignored | 295,841 / 3,264 |
+| overlay's own suite | 35 passed, 1 skipped | 35 passed, 1 skipped |
+| unmapped names | 0 | 0 |
+
+Worth reporting upstream to `DQN-Labs/nexus-tpu-fork` as an issue — the fix is one guard
+and their `inspect_ckpt.py` already classifies `dt_bias` as ignored, so it looks deliberate
+rather than accidental, which is exactly why it would have gone unnoticed.
+
+One thing this check does **not** settle: whether the loader's generic path can actually
+resolve `model.layers.N.linear_attn.dt_bias` onto the live `nnx.Param` once it stops being
+dropped. `gdn.py` declares it and `layers.py` assigns the submodule as `linear_attn`, and
+the suite's live-param-path test covers the contract, but the first TPU run should confirm
+it in the loader's `mapped` count rather than assuming.
+
 **A caveat about the overlay.** Its README documents a file layout (`qsa.py`, `ngram.py`,
 `weight_loader.py`, `quant.py`) that the v79 commit has outgrown, and its cited Kaggle
 datasets for real weights (`keithtyser/...-nvfp4`, `ram2121/...-gptq-4bit`) return 404 —

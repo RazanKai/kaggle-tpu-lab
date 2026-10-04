@@ -68,6 +68,8 @@ the one part of the port that already looks right.
 ```
 kernel/serve_qwen38_flash_next.py     the Kaggle kernel (same 6-step shape as the other recipes)
 notebook/…-tpu-serve.ipynb            the same flow as a run-it-yourself notebook
+patches/gdn-dt-bias-ignored.diff      fix for a silent weight-loading bug in the overlay (see below)
+tools/embed_patch.py                  re-embeds that patch into the kernel after edits
 tools/NOTES.md                        the budget arithmetic, the artifact survey, the open questions
 ```
 
@@ -102,9 +104,17 @@ text-only, no MTP (`--max-model-len` and `--max-num-seqs` are honored; passing
 
 ## What is actually verified
 
-The overlay's own CPU test suite is green on a clean modern stack (`jax 0.11.2`,
-`flax 0.12.10`, `torch 2.14.1+cpu`, `transformers 5.18.0`) — **35 passed, 1 skipped**,
-where the skip is the on-TPU end-to-end test:
+**The checkpoint contract.** Every tensor name in the real `nvidia/…-NVFP4` index —
+**299,545 of them** — was pushed through the overlay's own `map_checkpoint_name`,
+`stacked_target` and `is_ignored_missing`: **0 unmapped**, 295,841 mapped, 440 fused,
+3,264 deliberately ignored, and the architecture parses out of the real `config.json` as
+48 layers / 36 Gated-DeltaNet + 12 full attention / 512 experts / `hc_count` 4 /
+`ple_layer_ids` [2]. This is the check the fork's own `inspect_ckpt.py` performs on a TPU
+session; it needs only two metadata files, so it runs on a laptop.
+
+**The overlay's CPU suite.** Green on a clean modern stack (`jax 0.11.2`, `flax 0.12.10`,
+`torch 2.14.1+cpu`, `transformers 5.18.0`) — **35 passed, 1 skipped**, where the skip is
+the on-TPU end-to-end test:
 
 ```
 pytest tests/models/jax/test_qwen4_exp.py -q     # in the overlay checkout
@@ -115,6 +125,19 @@ That suite pins NVFP4 and GPTQ dequantization bit-exact against torch, QSA chunk
 prefill against full forward, the GDN norm against upstream, GatedResidual against the
 closed form, PLE hash/order isolation, the host-RAM table lookup, and sharding
 divisibility. It does **not** test real weights on real hardware — nobody has.
+
+**One bug, found and patched here.** The name-coverage check surfaced a silent
+weight-loading defect in the overlay, and this folder ships the fix. See
+[`patches/gdn-dt-bias-ignored.diff`](patches/gdn-dt-bias-ignored.diff): the loader's
+`IGNORED_MISSING_SUFFIXES` contains `_bias`, which also matches `linear_attn.dt_bias`, and
+`is_ignored_missing()` is consulted in the load path before anything that would keep it.
+GDN gates its recurrent state with `sigmoid(dt_bias + exp(A_log))`, so all **36**
+`dt_bias` tensors would have been dropped — in this checkpoint they are the *only* names
+matching `_bias` — leaving the decay at its zero initialisation on every linear-attention
+layer. The kernel applies the patch to the overlay checkout and refuses to serve if it
+stops applying. Verified: on a pristine overlay `is_ignored_missing` returns `True` for
+`dt_bias`, on the patched one `False`; the overlay's own suite stays green either way;
+the fix moves exactly 36 tensors from `dropped` to `mapped`.
 
 ## Known landmines
 
