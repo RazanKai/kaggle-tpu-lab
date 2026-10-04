@@ -536,6 +536,16 @@ else:
 
 # ---------------- 3. weights ----------------
 banner(3, "Model weights", "NVFP4 experts + FP8 n-gram table + bf16 rest, 135 GB total")
+# The n-gram table is never a JAX parameter: the overlay dequantizes the FP8 shards into a
+# bf16 HOST buffer (PLE_HOST_TABLES) and gathers rows there. 51.2e9 params x 2 bytes is
+# ~102 GB of host RAM, so report what the box actually has before the load starts.
+try:
+    _mi = dict(l.split(":", 1) for l in Path("/proc/meminfo").read_text().splitlines())
+    _kb = lambda k: int(_mi[k].split()[0]) / 1e6  # kB -> GB
+    log(f"   host RAM: {_kb('MemTotal'):.0f} GB total, {_kb('MemAvailable'):.0f} GB available "
+        f"(the n-gram table wants ~102 GB as a bf16 host buffer)")
+except Exception:
+    pass
 # Two ways in. A Kaggle *Model* attaches this 135 GB checkpoint fine; a Kaggle *Dataset* of
 # the same size stalls the session before it ever starts (reproduced at 119 GB across two
 # datasets and at 135 GB, while 77 GB mounts in seconds). Prefer the model when one is
