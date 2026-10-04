@@ -287,15 +287,46 @@ def install_engine_overlay():
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, dst)
-    r = subprocess.run(
-        [PY, "-c", "import tpu_inference.models.jax.qwen4_exp as m; print('OVERLAY_OK', m.__file__)"],
-        capture_output=True, text=True)
+    # Registries are per-process, and `vllm serve` is a fresh interpreter (plus worker
+    # processes). The overlay's startup hook is what maps Qwen4ExpForCausalLM to the JAX
+    # implementation in each of them; the fork ships it for exactly this reason and
+    # expects a .pth in site-packages, whose import line runs at interpreter startup.
+    # Copying the files alone is not enough — without this the server cannot resolve the
+    # architecture and dies minutes into a scarce TPU slot.
+    r = subprocess.run([PY, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                       capture_output=True, text=True)
+    purelib = (r.stdout or "").strip()
+    if not purelib:
+        log("   could not locate site-packages:", (r.stderr or "")[-300:])
+        return False
+    pth = Path(purelib, "qwen4exp_tpu_startup.pth")
+    pth.write_text("import tpu_inference.models.jax.qwen4_exp.startup\n")
+    log(f"   startup hook written, so every fresh interpreter registers the arch: {pth}")
+    # Prove it on a fresh interpreter before any weights are touched.
+    check = (
+        "import json, tempfile\n"
+        "from pathlib import Path\n"
+        "from transformers import AutoConfig\n"
+        "d = tempfile.mkdtemp()\n"
+        "Path(d, 'config.json').write_text(json.dumps({"
+        "'model_type':'qwen4_exp','architectures':['Qwen4ExpForCausalLM'],"
+        "'hidden_size':2560,'num_hidden_layers':48,"
+        "'text_config':{'model_type':'qwen4_exp','hidden_size':2560,"
+        "'num_hidden_layers':48,'hc_count':4}}))\n"
+        "c = AutoConfig.from_pretrained(d)\n"
+        "assert type(c).__name__ == 'Qwen4ExpConfig', type(c).__name__\n"
+        "print('AUTOCONFIG_OK', c.text_config.hidden_size)\n")
+    r = subprocess.run([PY, "-c", check], capture_output=True, text=True)
     out = (r.stdout or "") + (r.stderr or "")
     _raw.write("[overlay] " + out.replace("\n", "\n[overlay] ") + "\n")
     if r.returncode != 0:
-        log("   overlay import failed:", out[-1200:])
+        log("   overlay verification failed — the server could not load the model:", out[-1200:])
         return False
-    log("   overlay import OK:", out.strip().splitlines()[-1])
+    if "register() skipped" in out:
+        log("   the startup hook ran but model registration was SKIPPED, so vLLM would not "
+            "resolve Qwen4ExpForCausalLM to the JAX implementation. Refusing to continue.")
+        return False
+    log("   overlay verified: arch registered in a fresh interpreter, config parses")
     return True
 
 
