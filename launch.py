@@ -40,6 +40,9 @@ GLM_DATASETS = ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2",
 # and does not fit in a session's own disk). Create this dataset before first use; the
 # slug below is a placeholder. See qwen38-flash-next/tools/NOTES.md.
 FLASHNEXT_WEIGHTS_DATASET = "aigood/qwen38-flash-next-nvfp4"
+# The same checkpoint as a Kaggle Model. Datasets of this size (135 GB) stall the session
+# before it starts; the Model attaches in seconds, and its mounted index is intact.
+FLASHNEXT_MODEL_SOURCE = "keithtyser/qwen3-8-flash-next-nvfp4/PyTorch/radixark-modelopt-fp4/1"
 
 # One entry per model folder: the kernel script, the default kernel name, and (for our own engine) the package to embed.
 MODELS = {
@@ -47,7 +50,8 @@ MODELS = {
     "glm53-flash": {"kernel": HERE / "glm53-flash" / "kernel" / "serve_glm53.py", "slug": "glm53-tpu-serve",
                     "model_name": "glm-5.3-flash", "engine": HERE / "glm53-flash" / "engine" / "glm53", "minutes": 25},
     "qwen38-flash-next": {"kernel": HERE / "qwen38-flash-next" / "kernel" / "serve_qwen38_flash_next.py",
-                          "slug": "qwen38-flash-next-serve", "model_name": "qwen3.8-flash-next", "minutes": 45},
+                          "slug": "qwen38-flash-next-serve", "model_name": "qwen3.8-flash-next", "minutes": 45,
+                          "model_source": FLASHNEXT_MODEL_SOURCE},
 }
 
 # Friendly one-liners for each phase the kernel publishes.
@@ -163,6 +167,7 @@ def cmd_serve(args):
             "keepalive_min": args.keepalive_min,
             "weights_dataset": (FLASHNEXT_WEIGHTS_DATASET
                                 if args.weights_dataset == WEIGHTS_DATASET else args.weights_dataset),
+            "model_source": model.get("model_source", ""),
         }
         if args.no_tools:
             cfg["tool_call_parser"] = ""
@@ -172,7 +177,9 @@ def cmd_serve(args):
             cfg["fast_start"] = True
         # No env dataset: none has been built for this recipe's graphs, and attaching the
         # 27B bundle would only add a cache that can never match.
-        datasets = [cfg["weights_dataset"]]
+        # The weights arrive as a Kaggle Model (see FLASHNEXT_MODEL_SOURCE): dataset
+        # attachment stalls at this size, and a model source mounts the same bytes fine.
+        datasets = []
     else:
         cfg = {
             "ntfy_topic": topic,
@@ -214,7 +221,8 @@ def cmd_serve(args):
             "enable_tpu": "true",
             "enable_internet": "true",
             "dataset_sources": datasets,
-            "competition_sources": [], "kernel_sources": [], "model_sources": [],
+            "competition_sources": [], "kernel_sources": [],
+            "model_sources": [model["model_source"]] if model.get("model_source") else [],
         }, indent=1))
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
         r = kaggle("kernels", "push", "-p", str(td))

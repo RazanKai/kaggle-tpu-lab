@@ -51,6 +51,10 @@ DEFAULTS = {
     "overlay_repo": "https://github.com/DQN-Labs/nexus-tpu-fork",
     "overlay_commit": "be41c49",   # v79 — "host-RAM table live". Bump deliberately.
     "weights_dataset": "aigood/qwen38-flash-next-nvfp4",  # 135 GB: NVFP4 experts + FP8 PLE + bf16 rest
+    # Preferred source: a Kaggle *Model*. The same 135 GB checkpoint attaches as a Model in
+    # seconds and stalls the session as a Dataset (see ../tools/NOTES.md), and its mounted
+    # index is intact where the dataset download API returns a mangled one.
+    "model_source": "keithtyser/qwen3-8-flash-next-nvfp4/PyTorch/radixark-modelopt-fp4/1",
     "env_dataset": "",            # no compile cache exists for this recipe yet
     "hf_model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",  # the export the dataset above derives from
     "max_model_len": 32768,        # 32k to start: nothing here is proven at 262k
@@ -164,6 +168,16 @@ def find_input(*patterns):
         hits = glob.glob(f"/kaggle/input/{pat}") + glob.glob(f"/kaggle/input/datasets/*/{pat}")
         if hits:
             return hits[0]
+    return None
+
+
+def find_model_dir():
+    """A Kaggle Model source mounts at
+    /kaggle/input/models/<owner>/<slug>/<framework>/<variation>/<version>. Return the
+    deepest one that actually holds safetensors."""
+    for cand in sorted(glob.glob("/kaggle/input/models/*/*/*/*/*"), reverse=True):
+        if glob.glob(f"{cand}/*.safetensors"):
+            return cand
     return None
 
 
@@ -522,24 +536,32 @@ else:
 
 # ---------------- 3. weights ----------------
 banner(3, "Model weights", "NVFP4 experts + FP8 n-gram table + bf16 rest, 135 GB total")
-weights_slug = CFG["weights_dataset"].split("/")[-1]
-model_path = find_input(weights_slug)
-if model_path and not os.path.exists(os.path.join(model_path, "config.json")):
-    # Kaggle keeps dataset files either at the top level or one directory down
-    hits = glob.glob(f"{model_path}/**/config.json", recursive=True)
-    if hits:
-        model_path = os.path.dirname(hits[0])
-if model_path and os.path.exists(os.path.join(model_path, "config.json")):
-    publish("weights-mounted", path=model_path)
+# Two ways in. A Kaggle *Model* attaches this 135 GB checkpoint fine; a Kaggle *Dataset* of
+# the same size stalls the session before it ever starts (reproduced at 119 GB across two
+# datasets and at 135 GB, while 77 GB mounts in seconds). Prefer the model when one is
+# attached, fall back to a dataset, and only then to a Hugging Face download.
+model_path = find_model_dir()
+if model_path:
+    publish("weights-mounted", path=model_path, source="kaggle-model")
 else:
-    publish("weights-download", model=CFG["hf_model_id"],
-            note="attach the weights dataset to skip this: the HF mirror is ~106 GB and "
-                 "will not fit alongside it in /tmp on most sessions")
-    t = time.time()
-    from huggingface_hub import snapshot_download
-    model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*", "*.jinja"])
-    publish("weights-downloaded", secs=int(time.time() - t))
+    weights_slug = CFG["weights_dataset"].split("/")[-1]
+    model_path = find_input(weights_slug)
+    if model_path and not os.path.exists(os.path.join(model_path, "config.json")):
+        # Kaggle keeps dataset files either at the top level or one directory down
+        hits = glob.glob(f"{model_path}/**/config.json", recursive=True)
+        if hits:
+            model_path = os.path.dirname(hits[0])
+    if model_path and os.path.exists(os.path.join(model_path, "config.json")):
+        publish("weights-mounted", path=model_path, source="kaggle-dataset")
+    else:
+        publish("weights-download", model=CFG["hf_model_id"],
+                note="attach the Kaggle Model instead: the HF mirror is ~135 GB and will "
+                     "not fit in a session's own scratch space")
+        t = time.time()
+        from huggingface_hub import snapshot_download
+        model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
+            "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*", "*.jinja"])
+        publish("weights-downloaded", secs=int(time.time() - t))
 log(f"   weights at {model_path}")
 _quant = os.path.join(model_path, "hf_quant_config.json")
 if os.path.exists(_quant):
