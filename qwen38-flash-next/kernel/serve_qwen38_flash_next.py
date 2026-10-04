@@ -50,9 +50,9 @@ DEFAULTS = {
     # third-party overlay and is pinned by commit on purpose: it is still moving.
     "overlay_repo": "https://github.com/DQN-Labs/nexus-tpu-fork",
     "overlay_commit": "be41c49",   # v79 — "host-RAM table live". Bump deliberately.
-    "weights_dataset": "CHANGEME/qwen3-8-flash-next-nvfp4",  # Kaggle dataset holding the export
+    "weights_dataset": "aigood/qwen38-flash-next-nvfp4",  # 135 GB: NVFP4 experts + FP8 PLE + bf16 rest
     "env_dataset": "",            # no compile cache exists for this recipe yet
-    "hf_model_id": "nvidia/Qwen3.8-Flash-Next-NVFP4",  # ~124 GB; the format match is why — see NOTES.md
+    "hf_model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",  # the export the dataset above derives from
     "max_model_len": 32768,        # 32k to start: nothing here is proven at 262k
     "max_num_seqs": 8,
     "mtp_tokens": 0,               # the overlay's MTP head is a stub, not a drafter
@@ -316,6 +316,57 @@ def apply_engine_patches():
     return False
 
 
+def _safetensors_tensor_names(path):
+    """Tensor names from a safetensors header, without importing safetensors (only the
+    venv interpreter has it; this helper may run on the kernel's own one)."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n).decode("utf-8"))
+    hdr.pop("__metadata__", None)
+    return list(hdr)
+
+
+def ensure_usable_checkpoint(model_path):
+    """vLLM enumerates safetensors shards from model.safetensors.index.json, and this
+    dataset's index is 34 MB of long tensor names — the kind of file that has to be
+    readable before anything else can happen.
+
+    Kaggle's file-download API returns it mangled: the first 16 MiB is written twice and
+    the middle is dropped (reproduced twice here, byte-identical sha256, both unparseable).
+    A mounted dataset copy is probably intact, but a truncated index would abort a run
+    minutes into a TPU session, so check it and rebuild from the shard headers if needed.
+    Headers are a few hundred KB per shard; no weight data is read or copied here.
+    """
+    idx = Path(model_path, "model.safetensors.index.json")
+    if idx.exists():
+        try:
+            json.loads(idx.read_text())
+            log("   index.json parses; serving the dataset exactly as mounted")
+            return model_path
+        except Exception as e:  # noqa: BLE001
+            log(f"   index.json is unusable ({str(e)[:90]}) -> rebuilding it from headers")
+    shards = sorted(Path(model_path).glob("*.safetensors"))
+    if not shards:
+        log("   no *.safetensors in the mounted dataset — cannot continue")
+        return model_path
+    t = time.time()
+    wmap = {}
+    for sp in shards:
+        for name in _safetensors_tensor_names(sp):
+            wmap[name] = sp.name
+    log(f"   read {len(shards)} shard headers -> {len(wmap)} tensors in {int(time.time() - t)} s")
+    staged = Path(WORK, "checkpoint")
+    staged.mkdir(parents=True, exist_ok=True)
+    for f in Path(model_path).iterdir():
+        dst = staged / f.name
+        if not dst.exists():
+            os.symlink(f, dst)
+    (staged / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": sum(s.stat().st_size for s in shards)}, "weight_map": wmap}))
+    log(f"   staged a repaired checkpoint at {staged} (symlinks; nothing copied)")
+    return str(staged)
+
+
 def tpu_check():
     """Kaggle sometimes starts a "TPU" session with no TPU attached (a CPU-only container; most often on new or
     not-yet-verified accounts). jax then sees one device and vLLM dies minutes later with "Insufficient devices for
@@ -470,7 +521,7 @@ else:
     publish("cache-missing", note="cold compile: expect ~10 extra minutes")
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "NVFP4 experts + an FP8 n-gram table, ~124 GB")
+banner(3, "Model weights", "NVFP4 experts + FP8 n-gram table + bf16 rest, 135 GB total")
 weights_slug = CFG["weights_dataset"].split("/")[-1]
 model_path = find_input(weights_slug)
 if model_path and not os.path.exists(os.path.join(model_path, "config.json")):
@@ -497,6 +548,7 @@ if os.path.exists(_quant):
 else:
     log("   note: no hf_quant_config.json next to config.json — if these are bf16 weights "
         "they cannot fit in 128 GB of HBM. See ../tools/NOTES.md")
+model_path = ensure_usable_checkpoint(model_path)
 
 
 # ---------------- 4. vLLM server ----------------

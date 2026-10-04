@@ -39,7 +39,7 @@ GLM_DATASETS = ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2",
 # Qwen3.8-Flash-Next needs an NVFP4 export as a mounted dataset (the HF mirror is ~106 GB
 # and does not fit in a session's own disk). Create this dataset before first use; the
 # slug below is a placeholder. See qwen38-flash-next/tools/NOTES.md.
-FLASHNEXT_WEIGHTS_DATASET = "CHANGEME/qwen3-8-flash-next-nvfp4"
+FLASHNEXT_WEIGHTS_DATASET = "aigood/qwen38-flash-next-nvfp4"
 
 # One entry per model folder: the kernel script, the default kernel name, and (for our own engine) the package to embed.
 MODELS = {
