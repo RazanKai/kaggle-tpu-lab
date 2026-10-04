@@ -15,6 +15,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import re
 import secrets
 import shutil
@@ -91,14 +92,20 @@ def check_auth():
     r = kaggle("kernels", "list", "-m", "--page-size", "1")
     if r.returncode != 0:
         sys.exit("Kaggle CLI is not working or not authenticated.\n"
-                 "Install with `pip install kaggle`, then put your API token in place\n"
-                 "(https://www.kaggle.com/settings -> Create New Token).\n\n"
+                 "Install with `pip install kaggle`, then authenticate either way:\n"
+                 "  - export KAGGLE_API_TOKEN=<token from kaggle.com/settings -> Create New Token>\n"
+                 "  - or save that token in ~/.kaggle/access_token\n"
                  f"Error was:\n{(r.stderr or r.stdout).strip()}")
 
 
 def kaggle_username(cli_arg):
     if cli_arg:
         return cli_arg
+    # Token-based auth (KAGGLE_API_TOKEN / ~/.kaggle/access_token, CLI >= 2.x) carries no
+    # username, and `kaggle config view` then prints none, so check the env var first.
+    env = os.environ.get("KAGGLE_USERNAME")
+    if env:
+        return env.strip()
     r = kaggle("config", "view")
     m = re.search(r"username[:=]\s*(\S+)", (r.stdout or "") + (r.stderr or ""))
     if m and m.group(1) not in ("None", "-"):
