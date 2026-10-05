@@ -75,7 +75,8 @@ because upstream `tpu-inference` has no Qwen4Exp model at all.
 
 CONFIG = {"glm53-flash": {"streams": 4, "max_len": 262144, "reasoning_effort_default": "low", "vision": True, "keepalive_min": 90},
           "qwen38-flash-next": {"max_model_len": 32768, "max_num_seqs": 8, "text_only": True,
-                              "mtp_tokens": 0, "ple_cpu_offload": True, "keepalive_min": 90}}
+                              "mtp_tokens": 0, "ple_cpu_offload": True, "keepalive_min": 90,
+                              "ntfy_topic": ""}}
 
 CONFIG_NOTES = {"glm53-flash": """### Configuration
 The defaults above are what we serve. Things you might change:
@@ -100,6 +101,12 @@ The defaults above are the conservative ones, because nothing in this recipe has
 - `keepalive_min`: the server shuts itself down after this long, so a failed experiment does not burn your whole
   weekly TPU quota while you sleep.
 - `api_key`: set your own; otherwise one is generated and printed in the banner.
+- `ntfy_topic`: set this **before** you press Run All, and something other than this tab can follow the whole run.
+  Every step posts to `ntfy.sh/<topic>` — the phase, the timings, and the failure reason — so a watcher on another
+  machine can tell you when the endpoint is live. Use a random topic: the READY event carries the endpoint and the
+  API key. Left empty, the script just prints progress into this cell. Worth knowing why this matters: an
+  interactive Kaggle session creates no kernel *version*, so `kaggle kernels status/logs` return 404 for it and
+  nothing but this tab can see the run.
 """,
 }
 
