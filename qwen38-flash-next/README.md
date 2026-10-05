@@ -68,8 +68,9 @@ the one part of the port that already looks right.
 ```
 kernel/serve_qwen38_flash_next.py     the Kaggle kernel (same 6-step shape as the other recipes)
 notebook/…-tpu-serve.ipynb            the same flow as a run-it-yourself notebook
-patches/gdn-dt-bias-ignored.diff      fix for a silent weight-loading bug in the overlay (see below)
-tools/embed_patch.py                  re-embeds that patch into the kernel after edits
+patches/gdn-dt-bias-ignored.diff      GDN dt_bias was being dropped at load
+patches/ple-spill-mmap.diff           the n-gram table can spill to disk instead of 102 GB of host RAM
+tools/embed_patch.py                  re-embeds both patches into the kernel after edits
 tools/NOTES.md                        the budget arithmetic, the artifact survey, the open questions
 ```
 
@@ -141,11 +142,17 @@ the fix moves exactly 36 tensors from `dropped` to `mapped`.
 
 ## Known landmines
 
-- **The host-RAM n-gram table has to actually engage.** With it device-resident, the
-  weights alone are ~124 GB of a 128 GB budget; with it in host RAM, ~74 GB and the
-  arithmetic works. Upstream vLLM refuses the TPU path for exactly this feature, so the
-  bet is on the overlay's own implementation — which its commit history says is "live"
-  but which has only been exercised at small scale.
+- **The host-RAM n-gram table is the real constraint, and it is now handled.** The overlay
+  is unconditional about it: the table never becomes a JAX parameter, it is dequantized into
+  a **bf16 host buffer** (`PLE_HOST_TABLES`, no env var gates it, so our
+  `VLLM_PLE_CPU_OFFLOAD=1` is harmless but not the switch). For 51.2e9 params that is
+  **102 GB**, allocated on top of the ~51 GB of fp8 shards buffered while it assembles —
+  ~154 GB peak. Kaggle's container reports **33 GB total**, so the published path cannot
+  fit. `patches/ple-spill-mmap.diff` spills the fp8 shards to disk at load and memory-maps
+  them, dequantising only the rows actually gathered, and picks itself automatically from
+  `MemAvailable` (a large host keeps the dense path). Validated by forcing it on: the
+  overlay's own suite passes either way, including the test that drives the whole assembly
+  path and inspects the host table. See [`tools/NOTES.md` §4c](tools/NOTES.md).
 - **MXFP8 is not implemented** in the loader. This is why the `nvidia` export is the
   default rather than the 17 GB smaller `local-inference-lab` one, whose attention, GDN
   and shared-expert linears are MXFP8.

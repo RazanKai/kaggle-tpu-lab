@@ -1,0 +1,182 @@
+diff --git a/tpu_inference/models/jax/qwen4_exp/weight_loader.py b/tpu_inference/models/jax/qwen4_exp/weight_loader.py
+index 5acd5f9..85c4ed5 100644
+--- a/tpu_inference/models/jax/qwen4_exp/weight_loader.py
++++ b/tpu_inference/models/jax/qwen4_exp/weight_loader.py
+@@ -509,6 +509,82 @@ def _host_table_layout(arch, layer_idx):
+     return ple_padded_rows(sizes, div), hd
+ 
+ 
++# ---------------------------------------------------------------------------
++# PLE host table: dense bf16 buffer, or the fp8 shards spilled to disk and
++# memory-mapped.
++#
++# The dense path allocates total_rows*head_dim*2 bytes of host RAM -- 51.2e9
++# params is 102 GB -- *after* the 128 fp8 shards have already been buffered
++# (another 51 GB), so its peak is ~154 GB. That is comfortable on a big host
++# and impossible on a small one (Kaggle's CPU container reports 33 GB total).
++# The spill path writes each fp8 shard to disk as it arrives and maps the file,
++# so resident memory is the working set of the rows actually gathered rather
++# than the whole table. Chosen automatically from MemAvailable; force it with
++# QWEN4EXP_PLE_SPILL=1 and redirect it with QWEN4EXP_PLE_SPILL_DIR.
++# ---------------------------------------------------------------------------
++_PLE_SPILL_DIR = "/tmp/qwen4exp_ple"
++
++
++def _mem_available_bytes():
++    import os
++    try:
++        with open("/proc/meminfo") as fh:
++            mi = dict(l.split(":", 1) for l in fh.read().splitlines())
++        return int(mi["MemAvailable"].split()[0]) * 1024
++    except Exception:
++        return None
++
++
++def _spill_wanted(dense_bytes, fp8_bytes):
++    """True when the dense path (fp8 buffered + bf16 table) would not fit."""
++    import os
++    forced = os.environ.get("QWEN4EXP_PLE_SPILL")
++    if forced is not None:
++        return forced.strip().lower() not in ("", "0", "false", "no")
++    avail = _mem_available_bytes()
++    if avail is None:
++        return False
++    return avail < (dense_bytes + fp8_bytes) * 1.10
++
++
++class _SpilledPLETable:
++    """Duck-types the dense host table: ``table[ids] -> bf16 rows``.
++
++    Backed by one fp8 file on disk, memory-mapped, so host RAM holds only the
++    rows actually gathered instead of the full n*2-byte bf16 table. The only
++    consumer is ``ngram.PLEHostTable``, which just subscripts the object
++    (``rows = table[ids_np.reshape(-1)]``), so no forward-pass change is needed.
++    """
++
++    def __init__(self, path, shape, scale):
++        import os
++        import numpy as _np
++        self.path = str(path)
++        self.shape = tuple(int(d) for d in shape)
++        self.scale = float(scale)
++        # Present the array-like surface callers and tests inspect; the rows
++        # returned by __getitem__ really are bf16 (the fp8 dequant target).
++        self.dtype = _np.dtype(ml_dtypes.bfloat16)   # str() -> 'bfloat16', as numpy
++        self.ndim = len(self.shape)
++        self._mm = _np.memmap(self.path, dtype=_np.uint8, mode="r",
++                              shape=self.shape)
++        try:  # random access: stop the kernel reading whole shards ahead
++            fd = os.open(self.path, os.O_RDONLY)
++            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
++            os.close(fd)
++        except Exception:
++            pass
++
++    def __len__(self):
++        return self.shape[0]
++
++    def __getitem__(self, ids):
++        import numpy as _np
++        raw = self._mm[ids]                       # fp8 bytes, (n, head_dim)
++        fp8 = raw.view(ml_dtypes.float8_e4m3fn)
++        return (fp8.astype(_np.float32) * self.scale).astype(ml_dtypes.bfloat16)
++
++
+ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
+                            bits=4, group_size=128, nvfp4_group_size=16,
+                            log=None):
+@@ -921,7 +997,18 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
+                     f"LOAD-FAIL table tensor without layer index: {mapped}")
+             key = f"model.layers.{li}.ple.embedding"
+             buf = table_bufs.setdefault(
+-                key, {"shards": {}, "scale": None, "seen": 0})
++                key, {"shards": {}, "scale": None, "seen": 0,
++                      "spill": False, "shapes": {}})
++            if not buf.get("_decided"):
++                buf["_decided"] = True
++                _tr, _hd = _host_table_layout(arch, li)
++                if _spill_wanted(_tr * _hd * 2, _tr * _hd):
++                    buf["spill"] = True
++                    (log if callable(log) else _log)(
++                        f"PLE table spill ON for {key}: the dense path wants "
++                        f"{_tr * _hd * 3 / 1e9:.1f} GB of host RAM (fp8 shards "
++                        f"+ bf16 table); writing the fp8 shards to "
++                        f"{_PLE_SPILL_DIR} and memory-mapping them instead")
+             base, _, kind = mapped.rpartition(".")
+             if base.endswith(".weight_scale") or kind == "weight_scale":
+                 if buf["scale"] is not None:
+@@ -933,7 +1020,36 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
+                 if m2 is None:
+                     raise ValueError(
+                         f"LOAD-FAIL table shard without index: {mapped}")
+-                buf["shards"][int(m2.group(1))] = tensor
++                si = int(m2.group(1))
++                if buf["spill"]:
++                    import numpy as _np
++                    total_rows, hd = _host_table_layout(arch, li)
++                    rps, shd = (int(d) for d in tensor.shape)
++                    if shd != hd or total_rows % rps != 0:
++                        raise ValueError(
++                            f"LOAD-FAIL {key}: shard {tuple(tensor.shape)} "
++                            f"does not tile host layout {(total_rows, hd)}")
++                    mm = buf.get("_mm")
++                    if mm is None:
++                        import os
++                        os.makedirs(_PLE_SPILL_DIR, exist_ok=True)
++                        buf["_path"] = (f"{_PLE_SPILL_DIR}/"
++                                        f"{key.replace('.', '_')}.fp8")
++                        buf["_rows_per_shard"] = rps
++                        with open(buf["_path"], "wb") as fh:
++                            fh.truncate(total_rows * hd)
++                        mm = buf["_mm"] = _np.memmap(
++                            buf["_path"], dtype=_np.uint8, mode="r+",
++                            shape=(total_rows, hd))
++                    if rps != buf["_rows_per_shard"]:
++                        raise ValueError(
++                            f"LOAD-FAIL {key}: shard {si} has {rps} rows, "
++                            f"expected {buf['_rows_per_shard']}")
++                    mm[si * rps:(si + 1) * rps] = \
++                        tensor.view(_torch.uint8).numpy()
++                    buf["shapes"][si] = tuple(int(d) for d in tensor.shape)
++                else:
++                    buf["shards"][si] = tensor
+             buf["seen"] += 1
+             table_seen.append(mapped.rpartition(".")[0])
+             continue
+@@ -1046,7 +1162,8 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
+     host_tables: Dict[str, tuple] = {}
+     for key in sorted(table_bufs):
+         buf = table_bufs[key]
+-        idxs = sorted(buf["shards"])
++        idxs = sorted(buf["shapes"] if buf.get("spill")
++                      else buf["shards"])
+         if not idxs or idxs != list(range(min(idxs), max(idxs) + 1)):
+             raise ValueError(
+                 f"LOAD-FAIL {key}: non-contiguous table shards "
+@@ -1062,6 +1179,26 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
+         if li is None:
+             raise ValueError(f"LOAD-FAIL table key without layer: {key}")
+         total_rows, hd = _host_table_layout(arch, li)
++        if buf.get("spill"):
++            # Spill path: the fp8 shards are already on disk and mapped, so
++            # validate from the recorded shapes and register the mapped table
++            # instead of allocating the dense bf16 buffer.
++            if buf.get("_mm") is not None:
++                buf["_mm"].flush()
++                del buf["_mm"]
++            rps, shard_hd = buf["shapes"][idxs[0]]
++            if shard_hd != hd or total_rows % rps != 0 \
++                    or len(idxs) != total_rows // rps:
++                raise ValueError(
++                    f"LOAD-FAIL {key}: spilled shards do not tile host layout "
++                    f"{(total_rows, hd)}")
++            table = _SpilledPLETable(buf["_path"], (total_rows, hd), scale)
++            PLE_HOST_TABLES[key] = table
++            host_tables[key] = tuple(table.shape)
++            rep["assembled"] += 1
++            _log(f"LOAD-OK {key}: spilled fp8 table {tuple(table.shape)} "
++                 f"({len(idxs)} shards, scale={scale}, {buf['_path']} mapped)")
++            continue
+         first = buf["shards"][idxs[0]]
+         if first.ndim != 2 or first.dtype != _torch.float8_e4m3fn:
+             raise ValueError(

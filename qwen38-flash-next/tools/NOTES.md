@@ -202,6 +202,75 @@ dropped. `gdn.py` declares it and `layers.py` assigns the submodule as `linear_a
 the suite's live-param-path test covers the contract, but the first TPU run should confirm
 it in the loader's `mapped` count rather than assuming.
 
+## 4c. The host-RAM wall, and the patch that removes it
+
+The n-gram table is not a JAX parameter. The loader dequantizes its fp8 shards into a
+**bf16 host buffer** and forward gathers rows from it on the host:
+
+```python
+host = _np.empty((total_rows, hd), dtype=ml_dtypes.bfloat16)   # no switch, no env var
+```
+
+Read from the code rather than the docs — and note the env var we set does nothing:
+`grep -r os.environ tpu_inference/models/jax/qwen4_exp/*.py` returns nothing, there is no
+`VLLM_PLE_CPU_OFFLOAD` check anywhere. The behaviour is unconditional, which is fine, but
+it means the requirement is real:
+
+| | |
+|---|---|
+| params in the table | 51,200,245,760 (128 shards × 2,500,012 rows × 160) |
+| fp8 shards, buffered while assembling | 51.2 GB |
+| bf16 host buffer | **102.4 GB** |
+| peak | **~154 GB** |
+
+Then I measured the box, with a free CPU-only diagnostic kernel:
+
+```
+host RAM: MemTotal=33 GB  MemAvailable=32 GB   swap_total=0 GB
+```
+
+33 GB, no swap. The published path cannot fit, on either the bf16 buffer or even the fp8
+shards. (The TPU VM may differ — a Cloud TPU v5e-8 host is a much larger machine — but
+nothing we can rely on.)
+
+**The fix**, `patches/ple-spill-mmap.diff`, is confined to the loader, because the
+consumer only ever subscripts the table:
+
+```python
+# ngram.py, unchanged
+table = PLE_HOST_TABLES.get(self.host_key)
+rows = table[ids_np.reshape(-1)]
+```
+
+So a memory-mapped object duck-types the dense array. The patch writes each fp8 shard to
+disk as it streams in (preallocated file, `POSIX_FADV_RANDOM`), registers a
+`_SpilledPLETable` that maps the file read-only and dequantises only the gathered rows,
+and decides between the two paths from `MemAvailable` — 1.10× the dense requirement, so a
+big host keeps the fast dense path and the 33 GB box spills automatically. It can be forced
+with `QWEN4EXP_PLE_SPILL=1` and redirected with `QWEN4EXP_PLE_SPILL_DIR` (default
+`/tmp/qwen4exp_ple`; Kaggle's `/tmp` had 1,149 GB free, while `/kaggle/working` had 21 GB).
+
+Host RAM becomes the working set of gathered rows instead of the whole table. The cost is
+disk-backed gathers: random rows across a 51 GB file, so expect page-cache churn rather
+than an OOM.
+
+**Evidence, all local:**
+
+| check | result |
+|---|---|
+| `_spill_wanted(102 GB, 51 GB)` on this box (15 GB free) | `True` — spills |
+| `_spill_wanted(2 GB, 1 GB)` on this box | `False` — keeps the dense path |
+| mapped gather vs dense, out-of-order ids, non-unit scale | identical |
+| same, through the real `PLEHostTable` consumer | identical |
+| overlay suite, dense path (default) | 35 passed, 1 skipped |
+| overlay suite, `QWEN4EXP_PLE_SPILL=1` | 35 passed, 1 skipped |
+| fresh clone + both embedded patches | applies clean, compiles, suite green |
+
+The forced-spill run is what matters: it makes `test_nvfp4_expert_assembly_and_dense_gaps`
+exercise the real assembly path, and that test caught two genuine gaps in my first draft —
+the mapped object had no `.dtype`, and then the wrong kind of `.dtype` (`str()` must give
+`'bfloat16'`, as numpy's does). Both fixed; the suite is the reason they were found.
+
 **A caveat about the overlay.** Its README documents a file layout (`qsa.py`, `ngram.py`,
 `weight_loader.py`, `quant.py`) that the v79 commit has outgrown, and its cited Kaggle
 datasets for real weights (`keithtyser/...-nvfp4`, `ram2121/...-gptq-4bit`) return 404 —
